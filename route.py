@@ -1,4 +1,5 @@
 import requests
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from departures import BASE, HEADERS, get_station_ids
@@ -6,14 +7,28 @@ from departures import BASE, HEADERS, get_station_ids
 _cache = {}
 
 
-def get_plan(eva, when):
-    """Fetch (and cache) the timetable for one station ID and one hour."""
+def get_plan(eva, when, retries=3):
+    """Fetch (and cache) the timetable for one station ID and one hour.
+    Retries if DB rate-limits us; never caches a failed request."""
     key = (eva, when.strftime("%y%m%d%H"))
-    if key not in _cache:
-        r = requests.get(f"{BASE}/plan/{eva}/{when:%y%m%d}/{when:%H}", headers=HEADERS, timeout=10)
-        _cache[key] = ET.fromstring(r.text) if r.status_code == 200 else None
-    return _cache[key]
+    if key in _cache:
+        return _cache[key]
 
+    for attempt in range(retries):
+        r = requests.get(f"{BASE}/plan/{eva}/{when:%y%m%d}/{when:%H}", headers=HEADERS, timeout=10)
+        if r.status_code == 200:
+            _cache[key] = ET.fromstring(r.text)
+            return _cache[key]
+        if r.status_code == 404:
+            _cache[key] = None  # no timetable for this ID/hour: safe to cache
+            return None
+        if r.status_code == 429:  # too many requests
+            wait = 15 * (attempt + 1)
+            print(f"    (DB rate limit, waiting {wait}s...)")
+            time.sleep(wait)
+            continue
+        return None  # other error: don't cache, try again next time
+    return None
 
 def parse_time(pt):
     return datetime.strptime(pt, "%y%m%d%H%M")
@@ -72,7 +87,7 @@ def find_direct_trains(origin, destination, start=None, hours=3,
 
     results = sorted(results, key=lambda r: r["departure"])[:max_results]
     for r in results:
-        arr_time, arr_pl = find_arrival(r["trip"], dest_ids, r["departure"])
+        arr_time, arr_pl = find_arrival(r["trip"], dest_ids, r["departure"], max_hours=12)
         r["arrival"] = arr_time
         r["arrival_platform"] = arr_pl
         r["duration_min"] = int((arr_time - r["departure"]).total_seconds() // 60) if arr_time else None
